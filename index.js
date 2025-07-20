@@ -27,15 +27,29 @@ const jiraAuthHeader = {
 };
 
 // Get assigned Jira issues (bugs + stories)
+// Updated: /jira/issues with filterable query params
 app.get("/jira/issues", async (req, res) => {
+  const { priority, createdAfter, createdBefore, status, type } = req.query;
+
+  let jqlParts = ["assignee = currentUser()"];
+
+  if (type) jqlParts.push(`issuetype = "${type}"`);
+  else jqlParts.push(`(issuetype = Bug OR issuetype = Story)`);
+
+  if (priority) jqlParts.push(`priority = "${priority}"`);
+  if (status) jqlParts.push(`status = "${status}"`);
+  if (createdAfter) jqlParts.push(`created >= "${createdAfter}"`);
+  if (createdBefore) jqlParts.push(`created <= "${createdBefore}"`);
+
+  const jql = jqlParts.join(" AND ") + " ORDER BY created DESC";
+
   try {
-    const jql = `assignee = currentUser() AND (issuetype = Bug OR issuetype = Story) ORDER BY created DESC`;
     const response = await axios.get(`${JIRA_BASE_URL}/rest/api/3/search`, {
       headers: jiraAuthHeader,
       params: {
         jql,
-        fields: "key,summary,issuetype,status,description",
-        maxResults: 10,
+        fields: "key,summary,issuetype,status,priority,description,created",
+        maxResults: 20,
       },
     });
 
@@ -44,58 +58,70 @@ app.get("/jira/issues", async (req, res) => {
       summary: issue.fields.summary,
       type: issue.fields.issuetype.name,
       status: issue.fields.status.name,
+      priority: issue.fields.priority?.name || "Not set",
+      created: issue.fields.created,
       description:
         issue.fields.description?.content?.[0]?.content?.[0]?.text ||
         "No description",
     }));
 
-    res.json(issues);
+    res.json({ issues, jql });
   } catch (error) {
-    console.error("Error fetching Jira issues:", error);
-    res.status(500).json({ error: "Failed to fetch issues from Jira" });
+    console.error("Error fetching filtered Jira issues:", error);
+    res.status(500).json({ error: "Failed to fetch filtered issues." });
   }
 });
 
 // Send issue context to Hugging Face and get solution
 app.post("/query-ai", async (req, res) => {
-  const prompt = req.body.prompt;
+  const { prompt, filters } = req.body;
 
   if (!prompt) {
     return res.status(400).json({ error: "Prompt is required." });
   }
+
   try {
+    const queryParams = new URLSearchParams(filters || {}).toString();
+    const issueResponse = await axios.get(
+      `http://localhost:${PORT}/jira/issues?${queryParams}`
+    );
+
+    const issuesContext = issueResponse.data.issues
+      .map(
+        (issue) =>
+          `- [${issue.key}] ${issue.summary} (${issue.status}, ${issue.priority})`
+      )
+      .join("\n");
+
+    const fullPrompt = `${prompt}\n\nRelated Jira issues:\n${issuesContext}`;
+
+    // Gemini expects input as parts array
     const aiResponse = await axios.post(
-      "https://openrouter.ai/api/v1/chat/completions",
+      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
       {
-        model: process.env.OR_MODEL_ID || "openai/gpt-3.5-turbo",
-        messages: [
+        contents: [
           {
-            role: "user",
-            content: prompt,
+            parts: [{ text: fullPrompt }],
           },
         ],
-        max_tokens: Number(process.env.OR_MAX_TOKENS) || 512,
       },
       {
         headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY}`,
           "Content-Type": "application/json",
-          "HTTP-Accept": "application/json",
+        },
+        params: {
+          key: process.env.GEMINI_API_KEY,
         },
       }
     );
 
-    console.log("=== RAW RESPONSE FROM OPENROUTER ===");
-    console.log(JSON.stringify(aiResponse.data, null, 2));
-
     const output =
-      aiResponse.data.choices?.[0]?.message?.content ||
-      "No response from model.";
+      aiResponse.data.candidates?.[0]?.content?.parts?.[0]?.text ||
+      "No response from Gemini.";
     res.json({ response: output });
   } catch (error) {
-    console.error("=== OPENROUTER API ERROR ===");
-    console.error(error.response?.data || error.message);
-    res.status(500).json({ error: "Failed to query AI model." });
+    console.error("Gemini API Error:", error.response?.data || error.message);
+    res.status(500).json({ error: "Failed to query Gemini AI." });
   }
 });
 
